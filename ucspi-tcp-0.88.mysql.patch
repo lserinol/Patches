@@ -1,0 +1,222 @@
+diff -ruN ucspi-tcp-0.88.org/error.h ucspi-tcp-0.88/error.h
+--- ucspi-tcp-0.88.org/error.h	2000-03-18 17:18:42.000000000 +0200
++++ ucspi-tcp-0.88/error.h	2008-01-08 15:53:52.000000000 +0200
+@@ -1,7 +1,7 @@
+ #ifndef ERROR_H
+ #define ERROR_H
+ 
+-extern int errno;
++#include <errno.h>
+ 
+ extern int error_intr;
+ extern int error_nomem;
+diff -ruN ucspi-tcp-0.88.org/Makefile ucspi-tcp-0.88/Makefile
+--- ucspi-tcp-0.88.org/Makefile	2000-03-18 17:18:42.000000000 +0200
++++ ucspi-tcp-0.88/Makefile	2008-01-08 15:58:37.000000000 +0200
+@@ -741,11 +741,13 @@
+ stralloc.h gen_alloc.h
+ 	./compile tcprulescheck.c
+ 
++mysql_libs=`mysql_config --libs`
++
+ tcpserver: \
+ load tcpserver.o rules.o remoteinfo.o timeoutconn.o cdb.a dns.a \
+ time.a unix.a byte.a socket.lib
+ 	./load tcpserver rules.o remoteinfo.o timeoutconn.o cdb.a \
+-	dns.a time.a unix.a byte.a  `cat socket.lib`
++	dns.a time.a unix.a byte.a  `cat socket.lib` ${mysql_libs}
+ 
+ tcpserver.o: \
+ compile tcpserver.c uint16.h str.h byte.h fmt.h scan.h ip4.h fd.h \
+diff -ruN ucspi-tcp-0.88.org/tcpserver.c ucspi-tcp-0.88/tcpserver.c
+--- ucspi-tcp-0.88.org/tcpserver.c	2000-03-18 17:18:42.000000000 +0200
++++ ucspi-tcp-0.88/tcpserver.c	2008-01-12 23:33:20.000000000 +0200
+@@ -1,5 +1,7 @@
+ #include <sys/types.h>
+ #include <sys/param.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
+ #include <netdb.h>
+ #include "uint16.h"
+ #include "str.h"
+@@ -26,11 +28,16 @@
+ #include "remoteinfo.h"
+ #include "rules.h"
+ #include "sig.h"
++#include <mysql/mysql.h>
+ #include "dns.h"
+ 
+ int verbosity = 1;
+ int flagkillopts = 1;
+ int flagdelay = 1;
++stralloc dbserver = {0};
++stralloc dbuser = {0};
++stralloc dbpass = {0};
++stralloc dbname = {0};
+ char *banner = "";
+ int flagremoteinfo = 1;
+ int flagremotehost = 1;
+@@ -72,6 +79,9 @@
+ int flagdeny = 0;
+ int flagallownorules = 0;
+ char *fnrules = 0;
++char *dbfile = 0;
++
++void checkdb(char *dbfile);
+ 
+ void drop_nomem(void)
+ {
+@@ -211,6 +221,8 @@
+     }
+   }
+ 
++  if (dbfile) checkdb(dbfile);
++
+   if (verbosity >= 2) {
+     strnum[fmt_ulong(strnum,getpid())] = 0;
+     if (!stralloc_copys(&tmp,"tcpserver: ")) drop_nomem();
+@@ -249,6 +261,7 @@
+ [ -b backlog ] \
+ [ -l localname ] \
+ [ -t timeout ] \
++[ -m db.conf ] \
+ host port program",0);
+   _exit(100);
+ }
+@@ -289,6 +302,119 @@
+   }
+ }
+ 
++void checkdb(char *dbfile) 
++{
++ 
++    MYSQL *conn;
++    MYSQL_RES *res;
++    MYSQL_ROW row;
++    stralloc sql = {0};
++    unsigned long myip;
++    char myipstr[FMT_ULONG];
++    struct stat st;
++    char *x;
++    int fd,i=0;
++    unsigned int next;
++    unsigned int xlen;
++
++
++    fd = open_read(dbfile);
++    if (fd == -1) 
++	strerr_die4sys(111,DROP,"unable to read ",dbfile,": ");
++  if (fstat(fd,&st) == 0)
++    if (st.st_size <= 0xffffffff) {
++      x = mmap(0,st.st_size,PROT_READ,MAP_SHARED,fd,0);
++      xlen=st.st_size;
++      while ((next = byte_chr(x,xlen,'|')) < xlen) {
++	    switch(i) {
++      		case 0:
++	       	if (!stralloc_copyb(&dbserver,x,next)) drop_nomem();
++	       	if (!stralloc_0(&dbserver)) drop_nomem();
++			break;
++      		case 1:
++	       	if (!stralloc_copyb(&dbuser,x,next)) drop_nomem();
++	       	if (!stralloc_0(&dbuser)) drop_nomem();
++			break;
++      		case 2:
++	       	if (!stralloc_copyb(&dbpass,x,next)) drop_nomem();
++	       	if (!stralloc_0(&dbpass)) drop_nomem();
++			break;
++      		case 3:
++	       	if (!stralloc_copyb(&dbname,x,next)) drop_nomem();
++	       	if (!stralloc_0(&dbname)) drop_nomem();
++			break;
++	    }
++	      i++;
++              ++next;
++              x += next; xlen -= next;
++
++      }
++
++    } else {
++	strerr_warn1("cannot read file",0);
++	close(fd);
++	return;
++    }
++   munmap(x,st.st_size);
++   close(fd);
++
++    conn = mysql_init(NULL);
++    mysql_options(conn,MYSQL_OPT_CONNECT_TIMEOUT,"2");
++    if (!mysql_real_connect(conn, dbserver.s, dbuser.s, dbpass.s, dbname.s, 0, NULL, 0)) {
++	strerr_warn1("tcpserver: unable to connect db server",0);
++	return;
++    }
++    myip = (16777216*remoteip[0])+ (65536*remoteip[1]) + (256*remoteip[2]) + remoteip[3];
++    myipstr[fmt_ulong(myipstr,myip)] = 0;
++ 
++   if (!stralloc_copys(&sql,"select decision,env from tcpserver_rules where ")) drop_nomem();
++
++   if (!stralloc_cats(&sql,myipstr)) drop_nomem();
++   if (!stralloc_cats(&sql," >= ip_start AND ")) drop_nomem();
++   if (!stralloc_cats(&sql,myipstr)) drop_nomem();
++   if (!stralloc_cats(&sql," <= ip_end")) drop_nomem();
++   if (!stralloc_cats(&sql," limit 1")) drop_nomem();
++   if (!stralloc_0(&sql)) drop_nomem();
++   if (mysql_query(conn, sql.s)) {
++       mysql_close(conn);
++       return;
++    }
++ 
++    res = mysql_use_result(conn);
++ 
++    if ((row = mysql_fetch_row(res)) != NULL) {
++	if (row[0]) {
++		if (*row[0]=='1') {
++			flagdeny=1;
++       			mysql_free_result(res);
++       			mysql_close(conn);
++			return;
++		}
++	}
++
++	if (row[1]) {
++  		unsigned int next0;
++  		unsigned int split;
++  		unsigned int datalen;
++
++		datalen=str_len(row[1]);
++  		while ((next0 = byte_chr(row[1],datalen,'\n')) < datalen) {
++					row[1][next0]=0;
++        				split = str_chr(row[1],'=');
++        				if (row[1][split] == '=') {
++          				row[1][split] = 0;
++          				env(row[1] ,row[1] + split + 1);
++    					}
++    				++next0;
++   	 			row[1] += next0; datalen -= next0;
++
++		}
++    	} 
++    }
++   mysql_free_result(res);
++   mysql_close(conn);
++}
++
+ main(int argc,char **argv)
+ {
+   char *hostname;
+@@ -300,7 +426,7 @@
+   int s;
+   int t;
+  
+-  while ((opt = getopt(argc,argv,"dDvqQhHrR1UXx:t:u:g:l:b:B:c:pPoO")) != opteof)
++  while ((opt = getopt(argc,argv,"dDvqQhHrR1UXx:m:t:u:g:l:b:B:c:pPoO")) != opteof)
+     switch(opt) {
+       case 'b': scan_ulong(optarg,&backlog); break;
+       case 'c': scan_ulong(optarg,&limit); break;
+@@ -309,6 +435,7 @@
+       case 'B': banner = optarg; break;
+       case 'd': flagdelay = 1; break;
+       case 'D': flagdelay = 0; break;
++      case 'm': dbfile = optarg; break;
+       case 'v': verbosity = 2; break;
+       case 'q': verbosity = 0; break;
+       case 'Q': verbosity = 1; break;

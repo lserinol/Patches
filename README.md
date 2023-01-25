@@ -19,4 +19,4 @@ So, I decided to write a patch which adds this new rbl option to clamsmtpd serve
 
 ## ucspi-tcp mysql patch
 
-Finally, I had spare time to finish my ucspi-tcp mysql patch . Putting tcpserver rules in a mysql table has many advantages like centralized access rule lists and easy management.
+Finally, I had spare time to finish my ucspi-tcp mysql patch . Putting tcpserver rules in a mysql table has many advantages like centralized access rule lists and easy management. http://qmail.org/
